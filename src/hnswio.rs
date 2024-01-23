@@ -141,80 +141,22 @@ pub struct DumpInit {
     // basename dump 
     basename : String,
     // to dump data
-    pub(crate) data_out : BufWriter<File>,
+    pub data_out : BufWriter<Vec<u8>>,
     // to dump graph
-    pub(crate) graph_out : BufWriter<File>,
+    pub graph_out : BufWriter<Vec<u8>>,
 } // end of 
 
 impl DumpInit {
 
     // This structure will check existence of dumps of same name and generate a unique filename if necessary according to overwrite flag
-    pub fn new(dir : PathBuf, basename_default : String, overwrite : bool) -> Self {
+    pub fn new(_dir : PathBuf, basename_default : String, _overwrite : bool) -> Self {
         // if we cannot overwrite data files (in case of mmap in particular)
         // we will ensure we have a unique basename
-        
-        let basename = match overwrite {
-            true => { basename_default }
-            false => { // we check 
-                let mut dataname = basename_default.clone();
-                dataname.push_str(".hnsw.data");
-                let mut datapath = dir.clone();
-                datapath.push(dataname);
-                let exist_res =  std::fs::metadata(datapath.as_os_str());
-                if exist_res.is_ok() {
-                    let unique_basename = loop {
-                        let mut unique_basename;
-                        let mut dataname : String;
-                        let id : usize = rand::thread_rng().gen_range(0..10000);
-                        let strid : String  = id.to_string();
-                        unique_basename = basename_default.clone();
-                        unique_basename.push('-');
-                        unique_basename.push_str(&strid);
-                        dataname = unique_basename.clone();
-                        dataname.push_str(".hnsw.data");
-                        let mut datapath = dir.clone();
-                        datapath.push(dataname);
-                        let exist_res =  std::fs::metadata(datapath.as_os_str());
-                        if !exist_res.is_ok() {
-                            break unique_basename;
-                        }
-                    };
-                    unique_basename
-                } 
-                else { 
-                    basename_default  
-                }  
-            }
-        };
         //
-        log::info!("\n dumping with (unique) basename : {}", basename);
+        let graph_out = BufWriter::new(Vec::<u8>::new());
+        let data_out = BufWriter::new(Vec::<u8>::new());
         //
-        let mut graphname = basename.clone();
-        graphname.push_str(".hnsw.graph");
-        let mut graphpath = dir.clone();
-        graphpath.push(graphname);
-        let graphfileres = OpenOptions::new().create(true).truncate(true).write(true).open(&graphpath);
-        if graphfileres.is_err() {
-            println!("HnswIo::reload_hnsw : could not open file {:?}", graphpath.as_os_str());
-            std::panic::panic_any("HnswIo::init : could not open file".to_string());            
-        }
-        let graphfile = graphfileres.unwrap();
-        //  same thing for data file
-        let mut dataname = basename.clone();
-        dataname.push_str(".hnsw.data");
-        let mut datapath = dir.clone();
-        datapath.push(dataname);
-        let datafileres = OpenOptions::new().create(true).truncate(true).write(true).open(&datapath);
-        if datafileres.is_err() {
-            println!("HnswIo::init : could not open file {:?}", datapath.as_os_str());
-            std::panic::panic_any("HnswIo::init : could not open file".to_string());            
-        }
-        let datafile = datafileres.unwrap();
-        //
-        let graph_out = BufWriter::new(graphfile);
-        let data_out = BufWriter::new(datafile);
-        //
-        DumpInit{basename, data_out, graph_out}
+        DumpInit{basename: basename_default, data_out, graph_out}
     }
 
     /// returns the basename used for the dump. May be it has been made unique to void overwriting a previous or mmapped dump
@@ -234,7 +176,10 @@ struct LoadInit {
     datafile : BufReader<File>,
 } // end of LoadInit
 
-
+pub struct LoadData {
+    pub graphfile: Vec<u8>,
+    pub datafile: Vec<u8>,
+}
 
 /// a structure to provide simplified methods for reloading a previous dump.  
 ///  
@@ -453,6 +398,88 @@ impl HnswIo {
         Ok(hnsw)
     } // end of load_hnsw
 
+    pub fn load_hnsw_from_data<'b, 'a, T, D>(&'a mut self, data: LoadData) -> anyhow::Result<Hnsw<'b, T,D> > 
+        where   T:'static+Serialize+DeserializeOwned+Clone+Sized+Send+Sync + std::fmt::Debug,
+                D:Distance<T>+Default+Send+Sync, 'a : 'b  {
+        //
+        log::debug!("\n\n HnswIo::load_hnsw ");
+        let start_t = SystemTime::now();
+        //
+        let init = data;
+        let data_in = &mut init.datafile.as_slice();
+        let graph_in = &mut init.graphfile.as_slice();
+        let description = load_description(graph_in)?;
+        //  In datafile , we must read MAGICDATAP and dimension and check
+        let mut it_slice = [0u8; std::mem::size_of::<u32>()];
+        data_in.read_exact(&mut it_slice)?;
+        let magic = u32::from_ne_bytes(it_slice);
+        assert_eq!(magic, MAGICDATAP, "magic not equal to MAGICDATAP in load_point");
+        //
+        let mut it_slice = [0u8; std::mem::size_of::<usize>()];
+        data_in.read_exact(&mut it_slice)?;
+        let dimension = usize::from_ne_bytes(it_slice);
+        assert_eq!(dimension, description.dimension, "data dimension incoherent {:?} {:?} ", 
+                dimension, description.dimension);
+        //
+        let _mode = description.dumpmode;
+        let distname = description.distname.clone();
+        // We must ensure that the distance stored matches the one asked for in loading hnsw
+        // for that we check for short names equality stripping 
+        log::debug!("distance in description = {:?}", distname);
+        let d_type_name = type_name::<D>().to_string();
+        let v: Vec<&str> = d_type_name.rsplit_terminator("::").collect();
+        for s in v {
+            log::info!(" distname in generic type argument {:?}", s);
+        }
+        if (std::any::TypeId::of::<T>() != std::any::TypeId::of::<NoData>())  &&  (d_type_name != distname) {
+            // for all types except NoData , distance asked in reload declaration and distance in dump must be equal!
+            let mut errmsg = String::from("error in distances : dumped distance is : ");
+            errmsg.push_str(&distname);
+            errmsg.push_str(" asked distance in loading is : ");
+            errmsg.push_str(&d_type_name);
+            log::error!(" distance in type argument : {:?}", d_type_name);
+            log::error!("error , dump is for distance = {:?}", distname);
+            return Err(anyhow!(errmsg));
+        }
+        let t_type = description.t_name.clone();
+        log::debug!("T type name in dump = {:?}", t_type);
+        // Do we use mmap at reload 
+        if self.options.use_mmap().0 {
+            let datamap_res = DataMap::from_hnswdump::<T>(self.dir.to_str().unwrap(), &self.basename);
+            if datamap_res.is_err() {
+                log::error!("load_hnsw could not initialize mmap")
+            }
+            else {
+                self.datamap = Some(datamap_res.unwrap());
+            }
+        }
+        // reloader can use datamap
+        let layer_point_indexation = self.load_point_indexation(graph_in, &description, data_in)?;
+        let data_dim = layer_point_indexation.get_data_dimension();
+        // 
+        let hnsw : Hnsw::<T,D> =  Hnsw{  max_nb_connection : description.max_nb_connection as usize,
+                            ef_construction : description.ef, 
+                            extend_candidates : true, 
+                            keep_pruned: false,
+                            max_layer: description.nb_layer as usize, 
+                            layer_indexed_points: layer_point_indexation,
+                            data_dimension : data_dim,
+                            dist_f: D::default(),
+                            searching : false,
+                            datamap_opt : true, // set datamap_opt to true
+                        } ;
+        //
+        log::debug!("load_hnsw completed");
+        let elapsed_t = start_t.elapsed().unwrap().as_secs() as f32;
+        if log::log_enabled!(log::Level::Info) {
+            log::info!("reload_hnsw : elapsed system time(s) {}", elapsed_t);
+        }
+        else {
+            println!("reload_hnsw : elapsed system time(s) {}", elapsed_t);
+        }
+        //
+        Ok(hnsw)
+    }
 
 
     /// reload a previously dumped hnsw structure
@@ -755,40 +782,40 @@ impl Description {
     /// 
     fn dump<W:Write>(&self, argmode : DumpMode, out : &mut io::BufWriter<W>) -> anyhow::Result<i32> {
         log::info!("in dump of description");
-        out.write(&MAGICDESCR_3.to_ne_bytes()).unwrap();
+        out.write_all(&MAGICDESCR_3.to_ne_bytes()).unwrap();
         let mode : u8 = match argmode {
             DumpMode::Full => 1,
             _              => 0,
         };
         // CAVEAT should check mode == self.mode
-        out.write(&mode.to_ne_bytes()).unwrap();
+        out.write_all(&mode.to_ne_bytes()).unwrap();
         // dump of max_nb_connection as u8!!
-        out.write(&self.max_nb_connection.to_ne_bytes()).unwrap();
-        out.write(&self.nb_layer.to_ne_bytes()).unwrap();
-        if self.nb_layer != NB_LAYER_MAX {
-            println!("dump of Description, nb_layer != NB_MAX_LAYER");
-            return Err(anyhow!("dump of Description, nb_layer != NB_MAX_LAYER"));
-        }
+        out.write_all(&self.max_nb_connection.to_ne_bytes()).unwrap();
+        out.write_all(&self.nb_layer.to_ne_bytes()).unwrap();
+        // if self.nb_layer != NB_LAYER_MAX {
+        //     println!("dump of Description, nb_layer != NB_MAX_LAYER");
+        //     return Err(anyhow!("dump of Description, nb_layer != NB_MAX_LAYER"));
+        // }
         //
         log::info!("dumping ef {:?}", self.ef);
-        out.write(&self.ef.to_ne_bytes()).unwrap();
+        out.write_all(&self.ef.to_ne_bytes()).unwrap();
         //
         log::info!("dumping nb point {:?}", self.nb_point);
-        out.write(&self.nb_point.to_ne_bytes()).unwrap();
+        out.write_all(&self.nb_point.to_ne_bytes()).unwrap();
         //
         log::info!("dumping dimension of data {:?}", self.dimension);
-        out.write(&self.dimension.to_ne_bytes()).unwrap();
+        out.write_all(&self.dimension.to_ne_bytes()).unwrap();
 
         // dump of distance name
         let namelen : usize = self.distname.len();
         log::info!("distance name {:?} ", self.distname);
-        out.write(&namelen.to_ne_bytes()).unwrap();
-        out.write(self.distname.as_bytes()).unwrap();
+        out.write_all(&namelen.to_ne_bytes()).unwrap();
+        out.write_all(self.distname.as_bytes()).unwrap();
         // dump of T value typename
         let namelen : usize = self.t_name.len();
         log::info!("T name {:?} ", self.t_name);
-        out.write(&namelen.to_ne_bytes()).unwrap();
-        out.write(self.t_name.as_bytes()).unwrap();
+        out.write_all(&namelen.to_ne_bytes()).unwrap();
+        out.write_all(self.t_name.as_bytes()).unwrap();
         //
         return Ok(1);
     } // end fo dump
@@ -916,13 +943,13 @@ pub fn load_description(io_in: &mut dyn Read)  -> anyhow::Result<Description> {
 fn dump_point<'a, T:Serialize+Clone+Sized+Send+Sync, W:Write>(point : &Point<T> , mode : DumpMode, 
                     graphout : &mut io::BufWriter<W>, dataout : &mut io::BufWriter<W>) -> anyhow::Result<i32> {
     //
-    graphout.write(&MAGICPOINT.to_ne_bytes()).unwrap();
+    graphout.write_all(&MAGICPOINT.to_ne_bytes()).unwrap();
     // dump ext_id: usize , layer : u8 , rank in layer : i32
-    graphout.write(&point.get_origin_id().to_ne_bytes()).unwrap();
+    graphout.write_all(&point.get_origin_id().to_ne_bytes()).unwrap();
     let p_id = point.get_point_id();
     if mode == DumpMode::Full {
-        graphout.write(&p_id.0.to_ne_bytes()).unwrap();
-        graphout.write(&p_id.1.to_ne_bytes()).unwrap();
+        graphout.write_all(&p_id.0.to_ne_bytes()).unwrap();
+        graphout.write_all(&p_id.1.to_ne_bytes()).unwrap();
     }
     log::trace!(" point dump {:?} {:?}  ", p_id, point.get_origin_id());
     // then dump neighborhood info : nb neighbours : u32 , then list of origin_id, layer, rank_in_layer
@@ -933,27 +960,27 @@ fn dump_point<'a, T:Serialize+Clone+Sized+Send+Sync, W:Write>(point : &Point<T> 
         // Caution : we dump number of neighbours as a usize, even if it cannot be so large!
         let nbg_l : usize = neighbours_at_l.len();
         log::trace!("\t dumping nbng : {} at l {}", nbg_l, l);
-        graphout.write(&nbg_l.to_ne_bytes()).unwrap();
+        graphout.write_all(&nbg_l.to_ne_bytes()).unwrap();
         for n in neighbours_at_l { // dump d_id : uszie , distance : f32, layer : u8, rank in layer : i32
-            graphout.write(&n.d_id.to_ne_bytes()).unwrap();
+            graphout.write_all(&n.d_id.to_ne_bytes()).unwrap();
             if mode == DumpMode::Full {
-                graphout.write(&n.p_id.0.to_ne_bytes()).unwrap();
-                graphout.write(&n.p_id.1.to_ne_bytes()).unwrap();
+                graphout.write_all(&n.p_id.0.to_ne_bytes()).unwrap();
+                graphout.write_all(&n.p_id.1.to_ne_bytes()).unwrap();
             }
-            graphout.write(&n.distance.to_ne_bytes()).unwrap();
+            graphout.write_all(&n.distance.to_ne_bytes()).unwrap();
 //                log::debug!("        voisins  {:?}  {:?}  {:?}", n.p_id,  n.d_id , n.distance);
         }
     }
     // now we dump data vector!
-    dataout.write(&MAGICDATAP.to_ne_bytes()).unwrap();
+    dataout.write_all(&MAGICDATAP.to_ne_bytes()).unwrap();
     let origin_u64 = point.get_origin_id() as u64;
-    dataout.write(&origin_u64.to_ne_bytes()).unwrap();
+    dataout.write_all(&origin_u64.to_ne_bytes()).unwrap();
     //
     let serialized = unsafe {
         std::slice::from_raw_parts(point.get_v().as_ptr() as *const u8, point.get_v().len() * std::mem::size_of::<T>()) };
     log::trace!("serializing len {:?}", serialized.len());
     let len_64 = serialized.len() as u64;
-    dataout.write(&len_64.to_ne_bytes()).unwrap();   
+    dataout.write_all(&len_64.to_ne_bytes()).unwrap();   
     dataout.write_all(&serialized).unwrap();
     //
     return Ok(1);
@@ -1137,13 +1164,13 @@ impl <'b, T:Serialize+DeserializeOwned+Clone+Send+Sync> HnswIoT for PointIndexat
         // dump max_layer
         let layers = self.points_by_layer.read();
         let nb_layer = layers.len() as u8;
-        graphout.write(&nb_layer.to_ne_bytes()).unwrap();
+        graphout.write_all(&nb_layer.to_ne_bytes()).unwrap();
         // dump layers from lower (most populatated to higher level)
         for i in 0..layers.len() {
             let nb_point = layers[i].len();
             log::debug!("dumping layer {:?}, nb_point {:?}", i, nb_point);
-            graphout.write(&MAGICLAYER.to_ne_bytes()).unwrap();
-            graphout.write(&nb_point.to_ne_bytes()).unwrap();
+            graphout.write_all(&MAGICLAYER.to_ne_bytes()).unwrap();
+            graphout.write_all(&nb_point.to_ne_bytes()).unwrap();
             for j in 0..layers[i].len() {
                 assert_eq!(layers[i][j].get_point_id() , PointId{0: i as u8,1:j as i32 });
                 dump_point(&layers[i][j], mode, graphout, dataout)?;
@@ -1153,11 +1180,11 @@ impl <'b, T:Serialize+DeserializeOwned+Clone+Send+Sync> HnswIoT for PointIndexat
         let ep_read = self.entry_point.read();
         assert!(ep_read.is_some());
         let ep = ep_read.as_ref().unwrap();
-        graphout.write(&ep.get_origin_id().to_ne_bytes()).unwrap();
+        graphout.write_all(&ep.get_origin_id().to_ne_bytes()).unwrap();
         let p_id = ep.get_point_id();
         if mode == DumpMode::Full {
-            graphout.write(&p_id.0.to_ne_bytes()).unwrap();
-            graphout.write(&p_id.1.to_ne_bytes()).unwrap();
+            graphout.write_all(&p_id.0.to_ne_bytes()).unwrap();
+            graphout.write_all(&p_id.1.to_ne_bytes()).unwrap();
         }
         log::info!("dumped entry_point origin_d {:?}, p_id {:?} ", ep.get_origin_id(), p_id);
         //
@@ -1204,8 +1231,8 @@ impl <'b, T:Serialize+DeserializeOwned+Clone+Sized+Send+Sync, D: Distance<T>+Sen
         log::debug!("dump  obtained typename {:?}", type_name::<T>());
         description.dump(mode, graphout)?;
         // We must dump a header for dataout.
-        dataout.write(&MAGICDATAP.to_ne_bytes()).unwrap();
-        dataout.write(&datadim.to_ne_bytes()).unwrap();
+        dataout.write_all(&MAGICDATAP.to_ne_bytes()).unwrap();
+        dataout.write_all(&datadim.to_ne_bytes()).unwrap();
         //
         self.layer_indexed_points.dump(mode, dumpinit)?;
         Ok(1)
